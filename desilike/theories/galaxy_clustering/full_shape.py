@@ -3849,6 +3849,16 @@ class FKPTJAXPTSpectrum2Poles(Calculator):
                 f"Unknown or unsupported model={self._model!r}. "
                 "Expected 'LCDM'/'GR', 'HS', 'NDGP', 'HDKI', or 'PHENOM'."
             )
+        if model_u in ('LCDM', 'GR') or (model_u == 'HDKI' and variant_u in ('EFT_DE', 'EFTDE')):
+            # The CPL background of the template's cosmology, for the source (3/2 Omega_m(a)) and
+            # friction (2 + dln H / dln a) terms of fkptjax's growth and beyond-EdS kernel ODEs.
+            # Left out, fkptjax takes w0 = -1, wa = 0 whatever the cosmology, so on a w0wa
+            # background the kernel constants came out for LCDM while P(k), f(k) and the EFT
+            # source were the w0wa model's. Read at call time like the EFT source below, so a
+            # sampled w0_fld / wa_fld reaches the kernels. Identical to the default on LCDM.
+            # Only these models: the ISiTGR ones get w0 / wa from desi-clustering's
+            # MGPTSpectrum2Poles. mg_params_override still wins.
+            out.update(w0=float(self.template.cosmo['w0_fld']), wa=float(self.template.cosmo['wa_fld']))
         out.update(self._mg_params_override)
         if model_u == 'HDKI' and variant_u in ('EFT_DE', 'EFTDE'):
             # The source is the finite coefficients (h1, D0, N3, N5), from which fkptjax forms
