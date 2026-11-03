@@ -2730,7 +2730,13 @@ class FOLPSTracerSpectrum2Poles(Calculator):
     the tree-level kernel becomes :math:`b_1 + f\mu^2 + b_A (\mu^2 - 1/3)`, the linear form of a selection-dependent anisotropic
     bias (e.g. a selection on intrinsic alignments). It enters the IR-resummed tree-level term only, not the loops. It is normalised as
     ``b1`` in each basis (physical bases: divided by :math:`A A_\mathrm{AP}^{1/2}`, A the amplitude rescaling); a cross spectrum
-    uses each tracer's own ``bA``. Prior :math:`\mathcal{N}(0, 2)` (physical bases).
+    uses each tracer's own ``bA``. Prior :math:`\mathcal{N}(0, 2)` (physical bases). With the fkptjax pt too (2026-11-02).
+    The same term can instead be sampled as the total linear :math:`\mu^2` amplitude, ``fbA`` (free it in place of ``bA``; freeing both
+    raises): writing the kernel :math:`(b_1 - b_A/3) + (f + b_A)\mu^2`, ``fbA`` is :math:`f_0 + b_A` normalised as ``b1``, i.e.
+    :math:`(f_0 + b_A) A A_\mathrm{AP}^{1/2} = \sigma_8(z) (f_0 + b_A) A_\mathrm{AP}^{1/2} / \sigma_8^\mathrm{fid}(z)` in the physical
+    bases, the combination the tree-level RSD measures, and :math:`b_A` = ``fbA`` / (:math:`A A_\mathrm{AP}^{1/2}`) - :math:`f_0` at
+    each call, :math:`f_0` the pt's large-scale growth rate (the one its tree-level kernel multiplies :math:`\mu^2` by). Off by
+    default; prior :math:`\mathcal{U}(-1, 3)` (physical bases), i.e. flat in :math:`b_A` at fixed cosmology.
 
     mu : int, default=6
         Number of :math:`\mu` bins for multipole integration.
@@ -2829,6 +2835,9 @@ class FOLPSTracerSpectrum2Poles(Calculator):
                 Parameter('sn1', value=0., fixed=True, prior=dict(dist='norm', loc=0., scale=5.), ref=dict(dist='norm', loc=0., scale=1.), latex='s_{n,1}'),
                 # anisotropic linear bias (selection effects), off (fixed at 0) by default
                 Parameter('bA', value=0., fixed=True, prior=dict(dist='norm', loc=0., scale=2.), ref=dict(dist='norm', loc=0., scale=0.1), latex='b_A'),
+                # ... or sampled as the total linear mu^2 amplitude (f0 + bA), normalised as b1; off by default
+                Parameter('fbA', value=0.8, fixed=True, prior=dict(dist='uniform', limits=[-1., 3.]), ref=dict(dist='norm', loc=0.8, scale=0.1),
+                          latex=r'(f + b_A)\sigma_8'),
             ]
         else:
             auto_params = [
@@ -2845,6 +2854,7 @@ class FOLPSTracerSpectrum2Poles(Calculator):
                 Parameter('sn2', value=0., prior=None, ref=dict(dist='norm', loc=0., scale=0.1), latex='s_{n,2}'),
                 Parameter('sn1', value=0., fixed=True, prior=None, ref=dict(dist='norm', loc=0., scale=0.1), latex='s_{n,1}'),
                 Parameter('bA', value=0., fixed=True, prior=None, ref=dict(dist='norm', loc=0., scale=0.1), latex='b_A'),
+                Parameter('fbA', value=0.8, fixed=True, prior=None, ref=dict(dist='norm', loc=0.8, scale=0.1), latex='f + b_A'),
             ]
         not_shared = ('sn0', 'sn2', 'sn1')
         if 'damping' not in cross_sharing_mode:
@@ -3058,10 +3068,16 @@ class FOLPSTracerSpectrum2Poles(Calculator):
         kw_sn1 = {} if self.sn1.fixed else {'sn1': sn1}
         # bA off (all fixed): not passed, bit-identical baseline; as sn1, decided on the static `fixed` flag
         params_bA = self.bA if isinstance(self.bA, tuple) else (self.bA,)
+        # ... or its fbA parametrisation, the total linear mu^2 amplitude f0 + bA (see the class docstring)
+        params_fbA = self.fbA if isinstance(self.fbA, tuple) else (self.fbA,)
         # a parameter tied to another by an expression (derived str, e.g. b_A(h0) = -b_A(h1)) is active although not varied
         inactive = lambda param: param.fixed and not isinstance(param.derived, str)
+        with_bA = not all(inactive(param) for param in params_bA)
+        with_fbA = not all(inactive(param) for param in params_fbA)
+        if with_bA and with_fbA:
+            raise ValueError('bA and fbA are two parametrisations of the same anisotropic linear bias: free one of them, not both')
         kw_bA = {}
-        if not all(inactive(param) for param in params_bA):
+        if with_bA or with_fbA:
             # (bA_a, bA_b), normalised as b1 in the prior basis
             A = self.pt.sigma8 / self.pt.sigma8_fid
             if self._prior_basis in ('physical', 'physical_aap'):
@@ -3071,7 +3087,11 @@ class FOLPSTracerSpectrum2Poles(Calculator):
                 norm = 1.
             else:  # 'tcm_chudaykin_aap'
                 norm = A
-            kw_bA['bA'] = tuple(param.value / norm for param in (params_bA * 2 if len(params_bA) == 1 else params_bA))
+            if with_fbA:
+                # fbA = (f0 + bA) norm, with the large-scale growth rate the pt's tree-level kernel multiplies mu^2 by
+                kw_bA['bA'] = tuple(param.value / norm - self.pt.f0 for param in (params_fbA * 2 if len(params_fbA) == 1 else params_fbA))
+            else:
+                kw_bA['bA'] = tuple(param.value / norm for param in (params_bA * 2 if len(params_bA) == 1 else params_bA))
         self.poles = self.pt.combine_bias_terms_spectrum2_poles(pars, bias_scheme, self._damping, damping_method=self._damping_method, use_GTNS=self._use_GTNS,
                                                                 redshift_smearing=redshift_smearing, **kw_sn1, **kw_bA, **cross_options)
         return self.poles
@@ -4098,7 +4118,7 @@ class FKPTJAXPTSpectrum2Poles(Calculator):
             self._xstop = jnp.log(1.0 / (1.0 + jnp.asarray(self.template.z, dtype=jnp.float64)))
 
     def combine_bias_terms_spectrum2_poles(self, pars, bias_scheme, damping, damping_method=None, use_GTNS=None, redshift_smearing=None,
-                                           sn1=None):
+                                           sn1=None, bA=None):
         """Evaluate power-spectrum multipoles for the FOLPS-ordered bias vector *pars*.
 
         Matches :meth:`FOLPSPTSpectrum2Poles.combine_bias_terms_spectrum2_poles`'s signature
@@ -4106,6 +4126,10 @@ class FKPTJAXPTSpectrum2Poles(Calculator):
         directly (same bias parametrization, same 12-element ordering, ``IR_resummation=True``
         hardcoded as in FOLPS). Reads only from attributes set by ``__call__`` (or
         ``tree_unflatten`` when emulated).
+
+        ``bA`` (2026-11-02): the anisotropic linear bias, ``(bA_a, bA_b)`` already in the folps basis, handed to fkptjax and from
+        there to FOLPS' tree-level kernel, as with the FOLPS pt. Applied downstream of the tables, so an emulated pt takes it as
+        it is. ``None`` (off) is not passed on at all: the call, hence the baseline, is the one from before.
         """
         # fkptjax only implements the original FOLPSD convention (tree-level Kaiser undamped,
         # GTNS kept); its None default keeps that, unlike the FOLPS pt where None = 'tree+loop+ctr'.
@@ -4123,7 +4147,7 @@ class FKPTJAXPTSpectrum2Poles(Calculator):
             self._table_state, jac=self.jac, kap=self.kap, muap=self.muap,
             pars=jnp.asarray(pars), mu=self._to_poles.mu, wmu=self._to_poles.wmu, ells=self.ells,
             bias_scheme=bias_scheme, IR_resummation=True, damping=damping,
-            to_poles=self._to_poles,
+            to_poles=self._to_poles, **({} if bA is None else {'bA': bA}),
         )
         if sn1 is not None:
             # The isotropic k^2 stochastic term (2026-10-23). fkptjax builds the multipoles itself, so

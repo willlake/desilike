@@ -711,6 +711,55 @@ class TestFOLPS:
             np.testing.assert_allclose(delta[0], amplitude * (1. / qpar**2 + 2. / qper**2) / 3., rtol=1e-8)
             np.testing.assert_allclose(delta[1], amplitude * 2. / 3. * (1. / qpar**2 - 1. / qper**2), rtol=1e-6, atol=1e-10 * amplitude.max())
 
+    @staticmethod
+    def _check_fbA(cls, **kwargs):
+        """``bA`` and its ``fbA`` parametrisation on *cls* (a FOLPS-basis tracer), away from the fiducial (A, A_AP != 1)."""
+        from desilike.base import get_params
+        from desilike.theories.galaxy_clustering import DirectSpectrum2Template
+        k, bA = np.linspace(0.02, 0.2, 19), 0.5
+        cosmo = {'h': 0.70, 'logA': 3.25, 'omega_cdm': 0.125}
+
+        def make(*free):
+            theory = cls(k=k, template=DirectSpectrum2Template(z=0.8), **kwargs)
+            for name in free:
+                for param in get_params(theory).select(basename=name):
+                    param.update(fixed=False)
+            return theory, _compile(theory)
+
+        theory_off, run_off = make()
+        assert get_params(theory_off)['bA'].fixed and get_params(theory_off)['fbA'].fixed
+        off = run_off(b1=2., **cosmo)
+        tol = dict(rtol=1e-10, atol=1e-12 * np.abs(off).max())
+        theory_bA, run_bA = make('bA')
+        # freed at 0: the same poles (exactly with the FOLPS pt; the fkptjax pt routes the zero through folps' bA branch)
+        np.testing.assert_allclose(run_bA(b1=2., bA=0., **cosmo), off, **tol)
+        poles_bA = run_bA(b1=2., bA=bA, **cosmo)
+        assert np.max(np.abs(poles_bA[1] - off[1])) > 0.1 * np.max(np.abs(off[1]))
+        # bA is sampled normalised as b1 (physical bA = bA / norm, norm = A A_AP^1/2); the same physical bA in the fbA
+        # parametrisation is fbA = (f0 + bA / norm) norm, f0 the pt's large-scale growth rate
+        pt = theory_bA.pt
+        norm = float(pt.sigma8 / pt.sigma8_fid) * float(1. / (pt.qper**2 * pt.qpar))**0.5
+        assert abs(norm - 1.) > 1e-2
+        _, run_fbA = make('fbA')
+        fbA = float(pt.f0) * norm + bA
+        np.testing.assert_allclose(run_fbA(b1=2., fbA=fbA, **cosmo), poles_bA, **tol)
+        np.testing.assert_allclose(run_fbA(_jit=True, b1=2., fbA=fbA, **cosmo), poles_bA, **tol)
+        np.testing.assert_allclose(run_fbA(b1=2., fbA=float(pt.f0) * norm, **cosmo), off, **tol)
+        with pytest.raises(ValueError, match='free one of them'):  # at build or at the first call
+            _, run_both = make('bA', 'fbA')
+            run_both(b1=2., **cosmo)
+
+    def test_fbA(self):
+        """The anisotropic linear bias sampled as the total linear mu^2 amplitude, ``fbA`` = (f0 + bA) A A_AP^1/2 (FOLPS pt)."""
+        from desilike.theories.galaxy_clustering import FOLPSTracerSpectrum2Poles
+        self._check_fbA(FOLPSTracerSpectrum2Poles)
+
+    def test_fbA_fkptjax(self):
+        """``bA`` / ``fbA`` through the fkptjax pt (LCDM control), which forwards bA to folps' tree-level kernel."""
+        pytest.importorskip('fkptjax')
+        from desilike.theories.galaxy_clustering import FKPTJAXTracerSpectrum2Poles
+        self._check_fbA(FKPTJAXTracerSpectrum2Poles, model='LCDM', mg_variant=None)
+
     def test_tracer_correlation(self):
         """FOLPSTracerCorrelation2Poles: shape in both bases."""
         from desilike.theories.galaxy_clustering import FOLPSTracerCorrelation2Poles
@@ -1169,8 +1218,9 @@ class TestCOMET:
         comet_names = {par.basename for par in get_params(COMETTracerSpectrum2Poles(k=k, pt=False, prior_basis='physical_aap'))
                        if not isinstance(par, Constraint)} - cosmo_names
         folps_names = {par.basename for par in get_params(FOLPSTracerSpectrum2Poles(k=k, prior_basis='physical_aap'))} - cosmo_names
-        # sn1: folps' isotropic k^2 stochastic term (off by default), not carried over to comet; bA: folps' anisotropic linear bias (off by default)
-        assert folps_names - comet_names == {'ct', 'X_FoG', 'sn1', 'bA'}, sorted(folps_names - comet_names)
+        # sn1: folps' isotropic k^2 stochastic term (off by default), not carried over to comet; bA: folps' anisotropic linear bias
+        # (off by default), and fbA its parametrisation as the total linear mu^2 amplitude (off by default)
+        assert folps_names - comet_names == {'ct', 'X_FoG', 'sn1', 'bA', 'fbA'}, sorted(folps_names - comet_names)
         assert comet_names - folps_names == {'sn22', 'avir'}, sorted(comet_names - folps_names)
 
         # Native bases keep comet's own names, and its isotropic-k^2 NP20 (no quadrupole).
